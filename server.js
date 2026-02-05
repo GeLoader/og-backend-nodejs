@@ -21,7 +21,7 @@ app.use(cors({
 const pool = mysql.createPool({
     host: process.env.DB_HOST || 'srv1508.hstgr.io',
     user: process.env.DB_USER || 'u585115589_omnig',
-    password: process.env.DB_PASSWORD || '|:S!>x6Rb',
+    password: process.env.DB_PASSWORD || '',
     database: process.env.DB_NAME || 'u585115589_omnig',
     port: parseInt(process.env.DB_PORT || '3306'),
     waitForConnections: true,
@@ -111,6 +111,30 @@ app.post('/api/projects', getCurrentUser, getAdminUser, async (req, res) => {
     res.json({ id, name, description, created_by, status: 'active' });
 });
 
+// Projects: Update (Admin)
+app.put('/api/projects/:id', getCurrentUser, getAdminUser, async (req, res) => {
+    const { id } = req.params;
+    const { name, description, status } = req.body;
+    
+    await pool.execute(
+        'UPDATE projects SET name = ?, description = ?, status = ? WHERE id = ?',
+        [name, description, status || 'active', id]
+    );
+    
+    res.json({ id, name, description, status: status || 'active' });
+});
+
+// Projects: Delete (Admin)
+app.delete('/api/projects/:id', getCurrentUser, getAdminUser, async (req, res) => {
+    const { id } = req.params;
+    
+    // Optional: Check if there are tasks or time entries associated with this project
+    // For now, simple delete
+    await pool.execute('DELETE FROM projects WHERE id = ?', [id]);
+    
+    res.json({ success: true, message: 'Project deleted' });
+});
+
 // Tasks: List
 app.get('/api/tasks', getCurrentUser, async (req, res) => {
     const { project_id } = req.query;
@@ -134,6 +158,26 @@ app.post('/api/tasks', getCurrentUser, getAdminUser, async (req, res) => {
         [id, name, description, project_id]
     );
     res.json({ id, name, description, project_id, status: 'active' });
+});
+
+// Tasks: Update (Admin)
+app.put('/api/tasks/:id', getCurrentUser, getAdminUser, async (req, res) => {
+    const { id } = req.params;
+    const { name, description, project_id, status } = req.body;
+    
+    await pool.execute(
+        'UPDATE tasks SET name = ?, description = ?, project_id = ?, status = ? WHERE id = ?',
+        [name, description, project_id, status || 'active', id]
+    );
+    
+    res.json({ id, name, description, project_id, status: status || 'active' });
+});
+
+// Tasks: Delete (Admin)
+app.delete('/api/tasks/:id', getCurrentUser, getAdminUser, async (req, res) => {
+    const { id } = req.params;
+    await pool.execute('DELETE FROM tasks WHERE id = ?', [id]);
+    res.json({ success: true, message: 'Task deleted' });
 });
 
 // Time Entries: List
