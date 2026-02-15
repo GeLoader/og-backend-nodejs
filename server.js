@@ -85,31 +85,121 @@ app.get('/api/auth/me', getCurrentUser, (req, res) => {
     res.json(userWithoutPassword);
 });
 
+// Auth: Change Password
+app.put('/api/auth/change-password', getCurrentUser, async (req, res) => {
+    try {
+        const { new_password } = req.body;
+
+        if (!new_password || new_password.length < 6) {
+            return res.status(400).json({ detail: 'Password must be at least 6 characters' });
+        }
+
+        const hashedPassword = await bcrypt.hash(new_password, 10);
+        await pool.execute(
+            'UPDATE users SET password = ? WHERE id = ?',
+            [hashedPassword, req.user.id]
+        );
+
+        res.json({ success: true, message: 'Password changed successfully' });
+    } catch (error) {
+        console.error('Change password error:', error);
+        res.status(500).json({ detail: 'Failed to change password' });
+    }
+});
+
+// NEW: Get User Time Tracking Settings
+app.get('/api/user/time-tracking-settings', getCurrentUser, async (req, res) => {
+    try {
+        const [rows] = await pool.execute(
+            'SELECT first_day_of_week, working_on_weekends FROM users WHERE id = ?',
+            [req.user.id]
+        );
+
+        if (rows.length === 0) {
+            return res.status(404).json({ detail: 'User not found' });
+        }
+
+        const settings = rows[0];
+        res.json({
+            first_day_of_week: settings.first_day_of_week || 'monday',
+            working_on_weekends: settings.working_on_weekends || false
+        });
+    } catch (error) {
+        console.error('Get time tracking settings error:', error);
+        res.status(500).json({ detail: 'Failed to get time tracking settings' });
+    }
+});
+
+// NEW: Update User Time Tracking Settings
+app.put('/api/user/time-tracking-settings', getCurrentUser, async (req, res) => {
+    try {
+        const { first_day_of_week, working_on_weekends } = req.body;
+
+        // Validate first_day_of_week
+        const validDays = ['monday', 'tuesday', 'wednesday', 'thursday', 'friday', 'saturday', 'sunday'];
+        if (first_day_of_week && !validDays.includes(first_day_of_week.toLowerCase())) {
+            return res.status(400).json({ detail: 'Invalid day of week' });
+        }
+
+        await pool.execute(
+            'UPDATE users SET first_day_of_week = ?, working_on_weekends = ? WHERE id = ?',
+            [first_day_of_week || 'monday', working_on_weekends || false, req.user.id]
+        );
+
+        res.json({
+            success: true,
+            message: 'Time tracking settings updated',
+            first_day_of_week: first_day_of_week || 'monday',
+            working_on_weekends: working_on_weekends || false
+        });
+    } catch (error) {
+        console.error('Update time tracking settings error:', error);
+        res.status(500).json({ detail: 'Failed to update time tracking settings' });
+    }
+});
+
 // Users: List (Admin)
 app.get('/api/users', getCurrentUser, getAdminUser, async (req, res) => {
     const [rows] = await pool.execute('SELECT id, email, name, role, status, created_at FROM users');
     res.json(rows);
 });
 
-// Employees: List (Admin)
+// Employees: List (Admin) - UPDATED to include project count and daily_hours
 app.get('/api/admin/employees', getCurrentUser, getAdminUser, async (req, res) => {
     const { status } = req.query;
-    let query = 'SELECT id, email, name, role, status, default_project, default_task, created_at FROM users WHERE role = "employee"';
+    let query = `
+        SELECT
+            u.id,
+            u.email,
+            u.name,
+            u.role,
+            u.status,
+            u.default_project,
+            u.default_task,
+            u.daily_hours,
+            u.created_at,
+            COUNT(DISTINCT up.project_id) as project_count
+        FROM users u
+        LEFT JOIN user_projects up ON u.id = up.user_id
+        WHERE u.role = "employee"`;
+
     const params = [];
 
     if (status && status !== 'all') {
-        query += ' AND status = ?';
+        query += ' AND u.status = ?';
         params.push(status);
     }
 
-    query += ' ORDER BY created_at DESC';
+    query += ' GROUP BY u.id, u.email, u.name, u.role, u.status, u.default_project, u.default_task, u.daily_hours, u.created_at';
+    query += ' ORDER BY u.created_at DESC';
+
     const [rows] = await pool.execute(query, params);
     res.json(rows);
 });
 
-// Employees: Create (Admin)
+// Employees: Create (Admin) - UPDATED to include daily_hours
 app.post('/api/admin/employees', getCurrentUser, getAdminUser, async (req, res) => {
-    const { name, email, password, status, default_project, default_task } = req.body;
+    const { name, email, password, status, default_project, default_task, daily_hours } = req.body;
 
     if (!name || !email || !password) {
         return res.status(400).json({ detail: 'Name, email, and password are required' });
@@ -120,11 +210,11 @@ app.post('/api/admin/employees', getCurrentUser, getAdminUser, async (req, res) 
 
     try {
         await pool.execute(
-            'INSERT INTO users (id, email, name, password, role, status, default_project, default_task) VALUES (?, ?, ?, ?, "employee", ?, ?, ?)',
-            [id, email, name, hashedPassword, status || 'active', default_project || null, default_task || null]
+            'INSERT INTO users (id, email, name, password, role, status, default_project, default_task, daily_hours) VALUES (?, ?, ?, ?, "employee", ?, ?, ?, ?)',
+            [id, email, name, hashedPassword, status || 'active', default_project || null, default_task || null, daily_hours || 8.0]
         );
 
-        res.json({ id, email, name, role: 'employee', status: status || 'active', created_at: new Date() });
+        res.json({ id, email, name, role: 'employee', status: status || 'active', daily_hours: daily_hours || 8.0, created_at: new Date() });
     } catch (error) {
         console.error('Create employee error:', error);
         if (error.code === 'ER_DUP_ENTRY') {
@@ -134,10 +224,10 @@ app.post('/api/admin/employees', getCurrentUser, getAdminUser, async (req, res) 
     }
 });
 
-// Employees: Update (Admin)
+// Employees: Update (Admin) - UPDATED to include daily_hours
 app.put('/api/admin/employees/:id', getCurrentUser, getAdminUser, async (req, res) => {
     const { id } = req.params;
-    const { name, email, password, status, default_project, default_task } = req.body;
+    const { name, email, password, status, default_project, default_task, daily_hours } = req.body;
 
     try {
         // Get current user data to handle missing fields in partial updates
@@ -150,21 +240,22 @@ app.put('/api/admin/employees/:id', getCurrentUser, getAdminUser, async (req, re
         const updateStatus = status !== undefined ? status : currentUser.status;
         const updateProject = default_project !== undefined ? default_project : currentUser.default_project;
         const updateTask = default_task !== undefined ? default_task : currentUser.default_task;
+        const updateDailyHours = daily_hours !== undefined ? daily_hours : currentUser.daily_hours;
 
         if (password) {
             const hashedPassword = await bcrypt.hash(password, 10);
             await pool.execute(
-                'UPDATE users SET name = ?, email = ?, password = ?, status = ?, default_project = ?, default_task = ? WHERE id = ?',
-                [updateName, updateEmail, hashedPassword, updateStatus, updateProject || null, updateTask || null, id]
+                'UPDATE users SET name = ?, email = ?, password = ?, status = ?, default_project = ?, default_task = ?, daily_hours = ? WHERE id = ?',
+                [updateName, updateEmail, hashedPassword, updateStatus, updateProject || null, updateTask || null, updateDailyHours, id]
             );
         } else {
             await pool.execute(
-                'UPDATE users SET name = ?, email = ?, status = ?, default_project = ?, default_task = ? WHERE id = ?',
-                [updateName, updateEmail, updateStatus, updateProject || null, updateTask || null, id]
+                'UPDATE users SET name = ?, email = ?, status = ?, default_project = ?, default_task = ?, daily_hours = ? WHERE id = ?',
+                [updateName, updateEmail, updateStatus, updateProject || null, updateTask || null, updateDailyHours, id]
             );
         }
 
-        res.json({ id, name, email, role: 'employee', status: status || 'active' });
+        res.json({ id, name: updateName, email: updateEmail, role: 'employee', status: updateStatus, daily_hours: updateDailyHours });
     } catch (error) {
         console.error('Update employee error:', error);
         if (error.code === 'ER_DUP_ENTRY') {
@@ -183,6 +274,74 @@ app.delete('/api/admin/employees/:id', getCurrentUser, getAdminUser, async (req,
         res.json({ success: true, message: 'Employee deleted' });
     } catch (error) {
         res.status(500).json({ detail: 'Failed to delete employee' });
+    }
+});
+
+// NEW: Get assigned projects for an employee
+app.get('/api/admin/employees/:id/projects', getCurrentUser, getAdminUser, async (req, res) => {
+    const { id } = req.params;
+
+    try {
+        const [rows] = await pool.execute(
+            `SELECT p.id, p.name, p.description, up.assigned_at
+             FROM user_projects up
+             JOIN projects p ON up.project_id = p.id
+             WHERE up.user_id = ?
+             ORDER BY up.assigned_at DESC`,
+            [id]
+        );
+        res.json(rows);
+    } catch (error) {
+        console.error('Get employee projects error:', error);
+        res.status(500).json({ detail: 'Failed to get employee projects' });
+    }
+});
+
+// NEW: Assign multiple projects to an employee
+app.post('/api/admin/employees/:id/projects/assign', getCurrentUser, getAdminUser, async (req, res) => {
+    const { id } = req.params;
+    const { project_ids } = req.body;
+
+    if (!Array.isArray(project_ids)) {
+        return res.status(400).json({ detail: 'project_ids must be an array' });
+    }
+
+    try {
+        // First, remove all existing assignments
+        await pool.execute('DELETE FROM user_projects WHERE user_id = ?', [id]);
+
+        // Then add new assignments
+        if (project_ids.length > 0) {
+            const values = project_ids.map(project_id => [uuidv4(), id, project_id, new Date()]);
+            const placeholders = values.map(() => '(?, ?, ?, ?)').join(', ');
+            const flatValues = values.flat();
+
+            await pool.execute(
+                `INSERT INTO user_projects (id, user_id, project_id, assigned_at) VALUES ${placeholders}`,
+                flatValues
+            );
+        }
+
+        res.json({ success: true, message: 'Projects assigned successfully', count: project_ids.length });
+    } catch (error) {
+        console.error('Assign projects error:', error);
+        res.status(500).json({ detail: 'Failed to assign projects: ' + error.message });
+    }
+});
+
+// NEW: Remove a project assignment from an employee
+app.delete('/api/admin/employees/:id/projects/:project_id', getCurrentUser, getAdminUser, async (req, res) => {
+    const { id, project_id } = req.params;
+
+    try {
+        await pool.execute(
+            'DELETE FROM user_projects WHERE user_id = ? AND project_id = ?',
+            [id, project_id]
+        );
+        res.json({ success: true, message: 'Project assignment removed' });
+    } catch (error) {
+        console.error('Remove project assignment error:', error);
+        res.status(500).json({ detail: 'Failed to remove project assignment' });
     }
 });
 
@@ -316,17 +475,17 @@ app.post('/api/time-entries/manual', getCurrentUser, async (req, res) => {
     const date = start.toISOString().split('T')[0];
 
     await pool.execute(
-        'INSERT INTO time_entries (id, user_id, project_id, task_id, start_time, end_time, duration, entry_type, date, notes) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
-        [id, user_id, project_id, task_id, start, end, calcDuration, 'manual', date, notes]
+        'INSERT INTO time_entries (id, user_id, project_id, task_id, start_time, end_time, duration, entry_type, date, notes) VALUES (?, ?, ?, ?, ?, ?, ?, "manual", ?, ?)',
+        [id, user_id, project_id, task_id, start, end, calcDuration, date, notes]
     );
 
-    // 🆕 AUTO-CREATE/UPDATE DRAFT TIMESHEET
+    // AUTO-CREATE/UPDATE DRAFT TIMESHEET
     await updateOrCreateDraftTimesheet(user_id, date);
 
     res.json({ id, user_id, project_id, task_id, start_time, end_time, duration: calcDuration, entry_type: 'manual', date, notes });
 });
 
-// 🆕 FIXED: Time Entries: Update (Edit)
+// Time Entries: Update (Edit) - UPDATED to also update timesheets table
 app.put('/api/time-entries/:id', getCurrentUser, async (req, res) => {
     const { id } = req.params;
     const { project_id, task_id, start_time, end_time, notes } = req.body;
@@ -334,7 +493,7 @@ app.put('/api/time-entries/:id', getCurrentUser, async (req, res) => {
     try {
         // Get existing entry
         const [entryRows] = await pool.execute('SELECT * FROM time_entries WHERE id = ?', [id]);
-        
+
         if (entryRows.length === 0) {
             return res.status(404).json({ detail: 'Time entry not found' });
         }
@@ -352,25 +511,25 @@ app.put('/api/time-entries/:id', getCurrentUser, async (req, res) => {
         const duration = Math.floor((end - start) / 1000);
         const date = start.toISOString().split('T')[0];
 
-        // Update entry
+        // 1. UPDATE TIME_ENTRIES TABLE
         await pool.execute(
             'UPDATE time_entries SET project_id = ?, task_id = ?, start_time = ?, end_time = ?, duration = ?, date = ?, notes = ? WHERE id = ?',
             [project_id, task_id, start, end, duration, date, notes || null, id]
         );
 
-        // Update related draft timesheet if exists
+        // 2. UPDATE TIMESHEETS TABLE
         await updateOrCreateDraftTimesheet(entry.user_id, date);
 
-        res.json({ 
-            id, 
-            user_id: entry.user_id, 
-            project_id, 
-            task_id, 
-            start_time, 
-            end_time, 
-            duration, 
-            date, 
-            notes 
+        res.json({
+            id,
+            user_id: entry.user_id,
+            project_id,
+            task_id,
+            start_time,
+            end_time,
+            duration,
+            date,
+            notes
         });
     } catch (error) {
         console.error('Update time entry error:', error);
@@ -378,13 +537,22 @@ app.put('/api/time-entries/:id', getCurrentUser, async (req, res) => {
     }
 });
 
-// FIXED: Time Entries: Delete - THIS WAS MISSING!
+// Time Entries: Delete
 app.delete('/api/time-entries/:id', getCurrentUser, async (req, res) => {
     const { id } = req.params;
     const user_id = req.user.id;
     const role = req.user.role;
 
     try {
+        // Get the entry first to get the date for timesheet update
+        const [entryRows] = await pool.execute('SELECT * FROM time_entries WHERE id = ?', [id]);
+
+        if (entryRows.length === 0) {
+            return res.status(404).json({ detail: 'Time entry not found' });
+        }
+
+        const entry = entryRows[0];
+
         // Employees can only delete their own entries, admins can delete any
         let query = 'DELETE FROM time_entries WHERE id = ?';
         const params = [id];
@@ -399,6 +567,9 @@ app.delete('/api/time-entries/:id', getCurrentUser, async (req, res) => {
         if (result.affectedRows === 0) {
             return res.status(404).json({ detail: 'Time entry not found or unauthorized' });
         }
+
+        // Update the related timesheet
+        await updateOrCreateDraftTimesheet(entry.user_id, entry.date);
 
         res.json({ success: true, message: 'Time entry deleted' });
     } catch (error) {
@@ -417,11 +588,11 @@ app.get('/api/timer/active', getCurrentUser, async (req, res) => {
             [user_id]
         );
 
-        if (rows.length > 0) {
-            res.json({ active: true, timer: rows[0] });
-        } else {
-            res.json({ active: false });
+        if (rows.length === 0) {
+            return res.json(null);
         }
+
+        res.json(rows[0]);
     } catch (error) {
         console.error('Get active timer error:', error);
         res.status(500).json({ detail: 'Failed to get active timer' });
@@ -433,94 +604,116 @@ app.post('/api/timer/start', getCurrentUser, async (req, res) => {
     const { project_id, task_id } = req.body;
     const user_id = req.user.id;
 
-    // Deactivate old timers
-    await pool.execute('UPDATE timer_sessions SET is_active = FALSE WHERE user_id = ?', [user_id]);
+    try {
+        // Check if there's already an active timer
+        const [activeRows] = await pool.execute(
+            'SELECT * FROM timer_sessions WHERE user_id = ? AND is_active = TRUE',
+            [user_id]
+        );
 
-    const id = uuidv4();
-    const now = new Date();
-    const date = now.toISOString().split('T')[0];
+        if (activeRows.length > 0) {
+            return res.status(400).json({ detail: 'Timer already running' });
+        }
 
-    await pool.execute(
-        'INSERT INTO timer_sessions (id, user_id, project_id, task_id, start_time, last_heartbeat, is_active, date) VALUES (?, ?, ?, ?, ?, ?, TRUE, ?)',
-        [id, user_id, project_id, task_id, now, now, date]
-    );
+        const id = uuidv4();
+        const start_time = new Date();
+        const date = start_time.toISOString().split('T')[0];
 
-    const [rows] = await pool.execute('SELECT * FROM timer_sessions WHERE id = ?', [id]);
-    res.json({ timer: rows[0] });
+        await pool.execute(
+            'INSERT INTO timer_sessions (id, user_id, project_id, task_id, start_time, last_heartbeat, is_active, date) VALUES (?, ?, ?, ?, ?, ?, TRUE, ?)',
+            [id, user_id, project_id || null, task_id || null, start_time, start_time, date]
+        );
+
+        res.json({
+            id,
+            user_id,
+            project_id,
+            task_id,
+            start_time,
+            is_active: true,
+            date
+        });
+    } catch (error) {
+        console.error('Start timer error:', error);
+        res.status(500).json({ detail: 'Failed to start timer' });
+    }
 });
 
 // Timer: Stop
 app.post('/api/timer/stop', getCurrentUser, async (req, res) => {
-    const { notes } = req.body;
     const user_id = req.user.id;
 
-    const [rows] = await pool.execute('SELECT * FROM timer_sessions WHERE user_id = ? AND is_active = TRUE LIMIT 1', [user_id]);
-    const timer = rows[0];
+    try {
+        // Get active timer
+        const [rows] = await pool.execute(
+            'SELECT * FROM timer_sessions WHERE user_id = ? AND is_active = TRUE',
+            [user_id]
+        );
 
-    if (!timer) return res.status(404).json({ detail: 'No active timer' });
+        if (rows.length === 0) {
+            return res.status(404).json({ detail: 'No active timer found' });
+        }
 
-    const end = new Date();
-    const duration = Math.floor((end - new Date(timer.start_time)) / 1000);
-    const entryId = uuidv4();
+        const timer = rows[0];
+        const end_time = new Date();
+        const duration = Math.floor((end_time - new Date(timer.start_time)) / 1000);
 
-    // Move to time_entries
-    await pool.execute(
-        'INSERT INTO time_entries (id, user_id, project_id, task_id, start_time, end_time, duration, entry_type, date, notes) VALUES (?, ?, ?, ?, ?, ?, ?, "timer", ?, ?)',
-        [entryId, user_id, timer.project_id, timer.task_id, timer.start_time, end, duration, timer.date, notes]
-    );
+        // Create time entry
+        const entryId = uuidv4();
+        await pool.execute(
+            'INSERT INTO time_entries (id, user_id, project_id, task_id, start_time, end_time, duration, entry_type, date) VALUES (?, ?, ?, ?, ?, ?, ?, "timer", ?)',
+            [entryId, user_id, timer.project_id, timer.task_id, timer.start_time, end_time, duration, timer.date]
+        );
 
-    // Stop session
-    await pool.execute('UPDATE timer_sessions SET is_active = FALSE WHERE id = ?', [timer.id]);
+        // Deactivate timer
+        await pool.execute(
+            'UPDATE timer_sessions SET is_active = FALSE WHERE id = ?',
+            [timer.id]
+        );
 
-    // 🆕 AUTO-CREATE/UPDATE DRAFT TIMESHEET
-    await updateOrCreateDraftTimesheet(user_id, timer.date);
+        // AUTO-CREATE/UPDATE DRAFT TIMESHEET
+        await updateOrCreateDraftTimesheet(user_id, timer.date);
 
-    res.json({ id: entryId, duration, status: 'stopped' });
+        res.json({
+            time_entry_id: entryId,
+            duration,
+            start_time: timer.start_time,
+            end_time
+        });
+    } catch (error) {
+        console.error('Stop timer error:', error);
+        res.status(500).json({ detail: 'Failed to stop timer' });
+    }
 });
 
-// Timer: Heartbeat
+// Timer: Heartbeat (keep alive)
 app.post('/api/timer/heartbeat', getCurrentUser, async (req, res) => {
     const user_id = req.user.id;
 
     try {
-        const now = new Date();
         await pool.execute(
             'UPDATE timer_sessions SET last_heartbeat = ? WHERE user_id = ? AND is_active = TRUE',
-            [now, user_id]
+            [new Date(), user_id]
         );
+
         res.json({ success: true });
     } catch (error) {
-        console.error('Heartbeat error:', error);
-        res.status(500).json({ detail: 'Heartbeat failed' });
+        console.error('Timer heartbeat error:', error);
+        res.status(500).json({ detail: 'Failed to update heartbeat' });
     }
 });
 
-// Timer: Active (Admin)
-app.get('/api/admin/active-timers', getCurrentUser, getAdminUser, async (req, res) => {
-    const [rows] = await pool.execute(`
-        SELECT ts.*, u.name as user_name, u.email as user_email, p.name as project_name, t.name as task_name
-        FROM timer_sessions ts
-        JOIN users u ON ts.user_id = u.id
-        LEFT JOIN projects p ON ts.project_id = p.id
-        LEFT JOIN tasks t ON ts.task_id = t.id
-        WHERE ts.is_active = TRUE
-    `);
-    res.json(rows);
-});
-
-// Timesheets: List with filtering by status
+// Timesheets: List - MODIFIED to compute total_hours from duration column
 app.get('/api/timesheets', getCurrentUser, async (req, res) => {
     const { status } = req.query;
-    let query = 'SELECT * FROM timesheets WHERE 1=1';
+    let query = 'SELECT *, ROUND(duration / 3600, 2) as total_hours FROM timesheets WHERE 1=1';
     const params = [];
 
-    // Filter by user for employees
     if (req.user.role === 'employee') {
         query += ' AND user_id = ?';
         params.push(req.user.id);
     }
 
-    // Filter by status if provided
     if (status) {
         query += ' AND status = ?';
         params.push(status);
@@ -531,71 +724,12 @@ app.get('/api/timesheets', getCurrentUser, async (req, res) => {
     res.json(rows);
 });
 
-// Timesheets: Submit - 🆕 UPDATED: Now creates notification for admin
-app.post('/api/timesheets/submit', getCurrentUser, async (req, res) => {
-    const { timesheet_id } = req.body;
-    const user_id = req.user.id;
-
-    try {
-        if (!timesheet_id) {
-            return res.status(400).json({ detail: 'Timesheet ID is required' });
-        }
-
-        // Get the timesheet
-        const [timesheetRows] = await pool.execute(
-            'SELECT * FROM timesheets WHERE id = ? AND user_id = ?',
-            [timesheet_id, user_id]
-        );
-
-        if (timesheetRows.length === 0) {
-            return res.status(404).json({ detail: 'Timesheet not found' });
-        }
-
-        const timesheet = timesheetRows[0];
-
-        // Only allow submitting draft timesheets
-        if (timesheet.status !== 'draft') {
-            return res.status(400).json({ detail: 'Only draft timesheets can be submitted' });
-        }
-
-        // Recalculate total hours before submitting (in case entries were added/removed)
-        const [[{total_seconds}]] = await pool.execute(
-            'SELECT COALESCE(SUM(duration), 0) as total_seconds FROM time_entries WHERE user_id = ? AND date >= ? AND date <= ?',
-            [user_id, timesheet.week_start, timesheet.week_end]
-        );
-        const total_hours = Math.round((total_seconds || 0) / 3600 * 100) / 100;
-
-        // Update the existing draft timesheet to submitted
-        await pool.execute(
-            'UPDATE timesheets SET status = ?, total_hours = ?, submitted_at = ? WHERE id = ?',
-            ['submitted', total_hours, new Date(), timesheet_id]
-        );
-
-        // 🆕 Create notification for admin
-        const [adminRows] = await pool.execute('SELECT id FROM users WHERE role = "admin" LIMIT 1');
-        if (adminRows.length > 0) {
-            const dateRange = formatDateRange(timesheet.week_start, timesheet.week_end);
-            await createNotification(
-                adminRows[0].id,
-                'New Timesheet Submitted',
-                `${req.user.name} submitted a timesheet for review (${dateRange})`,
-                'timesheet_submit'
-            );
-        }
-
-        res.json({ success: true, message: 'Timesheet submitted', id: timesheet_id });
-    } catch (error) {
-        console.error('Submit timesheet error:', error);
-        res.status(500).json({ detail: 'Failed to submit timesheet' });
-    }
-});
-
-// Timesheets: Get Entries for a specific timesheet
+// Timesheets: Get Entries for a Timesheet
 app.get('/api/timesheets/:id/entries', getCurrentUser, async (req, res) => {
     const { id } = req.params;
 
     try {
-        // Get timesheet details
+        // Get timesheet to verify access
         const [timesheetRows] = await pool.execute(
             'SELECT * FROM timesheets WHERE id = ?',
             [id]
@@ -612,9 +746,9 @@ app.get('/api/timesheets/:id/entries', getCurrentUser, async (req, res) => {
             return res.status(403).json({ detail: 'Unauthorized' });
         }
 
-        // Get all time entries for this timesheet period
+        // Get time entries for this timesheet's week
         const [entries] = await pool.execute(
-            'SELECT * FROM time_entries WHERE user_id = ? AND date >= ? AND date <= ? ORDER BY start_time ASC',
+            'SELECT * FROM time_entries WHERE user_id = ? AND date >= ? AND date <= ? ORDER BY date ASC, start_time ASC',
             [timesheet.user_id, timesheet.week_start, timesheet.week_end]
         );
 
@@ -625,7 +759,47 @@ app.get('/api/timesheets/:id/entries', getCurrentUser, async (req, res) => {
     }
 });
 
-// Timesheets: Reopen (change status back to draft)
+// Timesheets: Submit
+app.post('/api/timesheets/submit', getCurrentUser, async (req, res) => {
+    const { timesheet_id } = req.body;
+
+    try {
+        // Get timesheet
+        const [timesheetRows] = await pool.execute(
+            'SELECT * FROM timesheets WHERE id = ?',
+            [timesheet_id]
+        );
+
+        if (timesheetRows.length === 0) {
+            return res.status(404).json({ detail: 'Timesheet not found' });
+        }
+
+        const timesheet = timesheetRows[0];
+
+        // Check authorization
+        if (req.user.role === 'employee' && timesheet.user_id !== req.user.id) {
+            return res.status(403).json({ detail: 'Unauthorized' });
+        }
+
+        // Only allow submitting draft timesheets
+        if (timesheet.status !== 'draft') {
+            return res.status(400).json({ detail: 'Only draft timesheets can be submitted' });
+        }
+
+        // Update status to submitted
+        await pool.execute(
+            'UPDATE timesheets SET status = ?, submitted_at = ? WHERE id = ?',
+            ['submitted', new Date(), timesheet_id]
+        );
+
+        res.json({ success: true, message: 'Timesheet submitted for review' });
+    } catch (error) {
+        console.error('Submit timesheet error:', error);
+        res.status(500).json({ detail: 'Failed to submit timesheet' });
+    }
+});
+
+// Timesheets: Reopen
 app.put('/api/timesheets/:id/reopen', getCurrentUser, async (req, res) => {
     const { id } = req.params;
 
@@ -665,7 +839,7 @@ app.put('/api/timesheets/:id/reopen', getCurrentUser, async (req, res) => {
     }
 });
 
-// 🆕 Timesheets: Review (Approve/Deny) - ADMIN ONLY - THIS WAS MISSING!
+// Timesheets: Review (Approve/Deny) - ADMIN ONLY
 app.put('/api/timesheets/:id/review', getCurrentUser, getAdminUser, async (req, res) => {
     const { id } = req.params;
     const { status, admin_comment } = req.body;
@@ -699,7 +873,7 @@ app.put('/api/timesheets/:id/review', getCurrentUser, getAdminUser, async (req, 
             [status, admin_comment || null, new Date(), req.user.id, id]
         );
 
-        // 🆕 Create notification for employee
+        // Create notification for employee
         const dateRange = formatDateRange(timesheet.week_start, timesheet.week_end);
         await createNotification(
             timesheet.user_id,
@@ -726,7 +900,7 @@ app.get('/api/notifications', getCurrentUser, async (req, res) => {
     res.json(notifications);
 });
 
-// 🆕 Notifications: Get Unread Count
+// Notifications: Get Unread Count
 app.get('/api/notifications/unread-count', getCurrentUser, async (req, res) => {
     try {
         const [[result]] = await pool.execute(
@@ -740,7 +914,7 @@ app.get('/api/notifications/unread-count', getCurrentUser, async (req, res) => {
     }
 });
 
-// 🆕 Notifications: Mark as Read
+// Notifications: Mark as Read
 app.put('/api/notifications/:id/read', getCurrentUser, async (req, res) => {
     const { id } = req.params;
 
@@ -756,7 +930,7 @@ app.put('/api/notifications/:id/read', getCurrentUser, async (req, res) => {
     }
 });
 
-// 🆕 Notifications: Mark All as Read
+// Notifications: Mark All as Read
 app.put('/api/notifications/mark-all-read', getCurrentUser, async (req, res) => {
     try {
         await pool.execute(
@@ -773,11 +947,11 @@ app.put('/api/notifications/mark-all-read', getCurrentUser, async (req, res) => 
 // Dashboard: Stats
 app.get('/api/dashboard/stats', getCurrentUser, async (req, res) => {
     if (req.user.role === 'admin') {
-        const [[{total_employees}]] = await pool.execute('SELECT COUNT(*) as total_employees FROM users WHERE role = "employee"');
-        const [[{active_employees}]] = await pool.execute('SELECT COUNT(*) as active_employees FROM users WHERE role = "employee" AND status = "active"');
-        const [[{pending_timesheets}]] = await pool.execute('SELECT COUNT(*) as pending_timesheets FROM timesheets WHERE status = "submitted"');
-        const [[{total_projects}]] = await pool.execute('SELECT COUNT(*) as total_projects FROM projects');
-        const [[{active_timers}]] = await pool.execute('SELECT COUNT(*) as active_timers FROM timer_sessions WHERE is_active = TRUE');
+        const [[{ total_employees }]] = await pool.execute('SELECT COUNT(*) as total_employees FROM users WHERE role = "employee"');
+        const [[{ active_employees }]] = await pool.execute('SELECT COUNT(*) as active_employees FROM users WHERE role = "employee" AND status = "active"');
+        const [[{ pending_timesheets }]] = await pool.execute('SELECT COUNT(*) as pending_timesheets FROM timesheets WHERE status = "submitted"');
+        const [[{ total_projects }]] = await pool.execute('SELECT COUNT(*) as total_projects FROM projects');
+        const [[{ active_timers }]] = await pool.execute('SELECT COUNT(*) as active_timers FROM timer_sessions WHERE is_active = TRUE');
 
         res.json({
             total_employees,
@@ -788,14 +962,14 @@ app.get('/api/dashboard/stats', getCurrentUser, async (req, res) => {
         });
     } else {
         const today = new Date().toISOString().split('T')[0];
-        const [[{today_seconds}]] = await pool.execute('SELECT SUM(duration) as today_seconds FROM time_entries WHERE user_id = ? AND date = ?', [req.user.id, today]);
+        const [[{ today_seconds }]] = await pool.execute('SELECT SUM(duration) as today_seconds FROM time_entries WHERE user_id = ? AND date = ?', [req.user.id, today]);
         res.json({
             today_hours: Math.round((today_seconds || 0) / 3600 * 100) / 100
         });
     }
 });
 
-// 🆕 Reports: Generate Time Report
+// Reports: Generate Time Report
 app.get('/api/reports/time', getCurrentUser, async (req, res) => {
     try {
         const { start_date, end_date, group_by, user_id, project_id } = req.query;
@@ -807,14 +981,14 @@ app.get('/api/reports/time', getCurrentUser, async (req, res) => {
         // Build query based on group_by parameter
         let query = '';
         let params = [];
-        
+
         // Base query parts
         const baseFrom = `FROM time_entries te
             LEFT JOIN users u ON te.user_id = u.id
             LEFT JOIN projects p ON te.project_id = p.id
             LEFT JOIN tasks t ON te.task_id = t.id
             WHERE te.date >= ? AND te.date <= ?`;
-        
+
         params.push(start_date, end_date);
 
         // Add filters
@@ -836,37 +1010,37 @@ app.get('/api/reports/time', getCurrentUser, async (req, res) => {
         // Group by logic
         let selectClause = '';
         let groupByClause = '';
-        
+
         switch (group_by) {
             case 'user':
-                selectClause = `u.id, u.name as label, 
-                    ROUND(SUM(te.duration) / 3600, 2) as total_hours, 
+                selectClause = `u.id, u.name as label,
+                    ROUND(SUM(te.duration) / 3600, 2) as total_hours,
                     COUNT(te.id) as entry_count`;
                 groupByClause = 'GROUP BY u.id, u.name';
                 break;
             case 'project':
-                selectClause = `p.id, p.name as label, 
-                    ROUND(SUM(te.duration) / 3600, 2) as total_hours, 
+                selectClause = `p.id, p.name as label,
+                    ROUND(SUM(te.duration) / 3600, 2) as total_hours,
                     COUNT(te.id) as entry_count`;
                 groupByClause = 'GROUP BY p.id, p.name';
                 break;
             case 'task':
-                selectClause = `t.id, t.name as label, 
-                    ROUND(SUM(te.duration) / 3600, 2) as total_hours, 
+                selectClause = `t.id, t.name as label,
+                    ROUND(SUM(te.duration) / 3600, 2) as total_hours,
                     COUNT(te.id) as entry_count`;
                 groupByClause = 'GROUP BY t.id, t.name';
                 break;
             case 'date':
             default:
-                selectClause = `te.date as id, te.date as label, 
-                    ROUND(SUM(te.duration) / 3600, 2) as total_hours, 
+                selectClause = `te.date as id, te.date as label,
+                    ROUND(SUM(te.duration) / 3600, 2) as total_hours,
                     COUNT(te.id) as entry_count`;
                 groupByClause = 'GROUP BY te.date';
                 break;
         }
 
         const fullQuery = `SELECT ${selectClause} ${query} ${groupByClause} ORDER BY label`;
-        
+
         const [rows] = await pool.execute(fullQuery, params);
 
         // Calculate summary
@@ -893,31 +1067,50 @@ app.get('/api/reports/time', getCurrentUser, async (req, res) => {
     }
 });
 
-// 🆕 Reports: Export PDF
+// Reports: Export PDF - UPDATED with proper filtering
 app.get('/api/reports/export/pdf', getCurrentUser, async (req, res) => {
     try {
-        const { start_date, end_date, user_id } = req.query;
+        const { start_date, end_date, user_id, project_id } = req.query;
 
         if (!start_date || !end_date) {
             return res.status(400).json({ detail: 'start_date and end_date are required' });
         }
 
-        // Get time entries data
-        let query = `SELECT te.*, u.name as user_name, p.name as project_name, t.name as task_name
+        // Build query with joins to get approval status from timesheets
+        let query = `
+            SELECT 
+                te.*,
+                u.name as user_name,
+                u.email as user_email,
+                p.name as project_name,
+                t.name as task_name,
+                ts.status as approval_status
             FROM time_entries te
             LEFT JOIN users u ON te.user_id = u.id
             LEFT JOIN projects p ON te.project_id = p.id
             LEFT JOIN tasks t ON te.task_id = t.id
+            LEFT JOIN timesheets ts ON (
+                te.user_id = ts.user_id 
+                AND te.date >= ts.week_start 
+                AND te.date <= ts.week_end
+            )
             WHERE te.date >= ? AND te.date <= ?`;
-        
+
         const params = [start_date, end_date];
 
+        // Filter based on user role
         if (req.user.role === 'employee') {
             query += ' AND te.user_id = ?';
             params.push(req.user.id);
-        } else if (user_id) {
+        } else if (user_id && user_id !== 'all') {
             query += ' AND te.user_id = ?';
             params.push(user_id);
+        }
+
+        // Apply project filter
+        if (project_id && project_id !== 'all') {
+            query += ' AND te.project_id = ?';
+            params.push(project_id);
         }
 
         query += ' ORDER BY te.date DESC, te.start_time DESC';
@@ -925,53 +1118,123 @@ app.get('/api/reports/export/pdf', getCurrentUser, async (req, res) => {
         const [entries] = await pool.execute(query, params);
 
         // Create PDF
-        const doc = new PDFDocument({ margin: 50 });
-        
+        const doc = new PDFDocument({ margin: 50, size: 'A4' });
+
         // Set response headers
         res.setHeader('Content-Type', 'application/pdf');
-        res.setHeader('Content-Disposition', `attachment; filename=time_report_${start_date}_${end_date}.pdf`);
-        
+        res.setHeader('Content-Disposition', `attachment; filename="detailed_report_${start_date}_${end_date}.pdf"`);
+
         // Pipe PDF to response
         doc.pipe(res);
 
-        // Add content
-        doc.fontSize(20).text('Time Report', { align: 'center' });
+        // Add header
+        doc.fontSize(16).font('Helvetica-Bold').text('DETAILED REPORT', { align: 'center' });
         doc.moveDown();
-        doc.fontSize(12).text(`Period: ${start_date} to ${end_date}`, { align: 'center' });
-        doc.moveDown(2);
+
+        // Format dates for display
+        const startDateObj = new Date(start_date);
+        const endDateObj = new Date(end_date);
+        const dateOptions = { weekday: 'short', year: 'numeric', month: 'short', day: 'numeric' };
+        const formattedStart = startDateObj.toLocaleDateString('en-US', dateOptions);
+        const formattedEnd = endDateObj.toLocaleDateString('en-US', dateOptions);
+
+        doc.fontSize(12).font('Helvetica').fillColor('#666')
+            .text(`Time frame: ${formattedStart} - ${formattedEnd}`, { align: 'left' });
+        doc.moveDown();
 
         // Calculate totals
-        const totalHours = entries.reduce((sum, e) => sum + (e.duration / 3600), 0);
-        
-        doc.fontSize(14).text(`Total Hours: ${Math.round(totalHours * 100) / 100}h`);
-        doc.fontSize(14).text(`Total Entries: ${entries.length}`);
+        const totalSeconds = entries.reduce((sum, e) => sum + (e.duration || 0), 0);
+        const hours = Math.floor(totalSeconds / 3600);
+        const minutes = Math.floor((totalSeconds % 3600) / 60);
+        const seconds = totalSeconds % 60;
+        const totalHoursStr = `${hours}:${String(minutes).padStart(2, '0')}:${String(seconds).padStart(2, '0')}`;
+
+        doc.fontSize(12).font('Helvetica-Bold').fillColor('#000')
+            .text(`Total hours: ${totalHoursStr}`);
         doc.moveDown(2);
 
-        // Add table header
-        doc.fontSize(10);
+        // Group entries by date
+        const groupedByDate = {};
+        entries.forEach(entry => {
+            if (!groupedByDate[entry.date]) {
+                groupedByDate[entry.date] = [];
+            }
+            groupedByDate[entry.date].push(entry);
+        });
+
+        // Add table header styling
+        doc.fontSize(10).font('Helvetica-Bold').fillColor('#666');
         const tableTop = doc.y;
-        doc.text('Date', 50, tableTop, { width: 80 });
-        doc.text('Employee', 130, tableTop, { width: 100 });
-        doc.text('Project', 230, tableTop, { width: 100 });
-        doc.text('Hours', 330, tableTop, { width: 60 });
+        const columnWidths = { user: 100, project: 150, hours: 80, status: 100 };
+        const startX = 50;
+
+        doc.text('USER', startX, tableTop, { width: columnWidths.user });
+        doc.text('PROJECT', startX + columnWidths.user, tableTop, { width: columnWidths.project });
+        doc.text('TOTAL HOURS', startX + columnWidths.user + columnWidths.project, tableTop, { width: columnWidths.hours, align: 'right' });
+        doc.text('APPROVAL STATUS', startX + columnWidths.user + columnWidths.project + columnWidths.hours, tableTop, { width: columnWidths.status, align: 'center' });
+
+        doc.moveTo(startX, doc.y + 5).lineTo(550, doc.y + 5).stroke();
         doc.moveDown();
 
-        // Add entries
-        entries.forEach((entry, i) => {
-            const y = doc.y;
-            const hours = Math.round((entry.duration / 3600) * 100) / 100;
-            
-            doc.text(new Date(entry.date).toLocaleDateString('en-US', { weekday: 'short', year: 'numeric', month: 'short', day: 'numeric' }), 50, y, { width: 80 });
-            doc.text(entry.user_name || 'N/A', 130, y, { width: 100 });
-            doc.text(entry.project_name || 'No Project', 230, y, { width: 100 });
-            doc.text(`${hours}h`, 330, y, { width: 60 });
-            doc.moveDown(0.5);
+        // Add entries grouped by date
+        Object.keys(groupedByDate).sort((a, b) => new Date(b) - new Date(a)).forEach(date => {
+            const dateEntries = groupedByDate[date];
+            const dateObj = new Date(date);
+            const formattedDate = dateObj.toLocaleDateString('en-US', dateOptions);
 
-            // Add new page if needed
-            if (doc.y > 700) {
-                doc.addPage();
-            }
+            // Date header with gray background
+            const dateY = doc.y;
+            doc.rect(startX - 5, dateY, 500, 20).fillAndStroke('#f0f0f0', '#ccc');
+            doc.fontSize(11).font('Helvetica-Bold').fillColor('#000');
+            doc.text(formattedDate, startX, dateY + 5);
+
+            // Calculate date total
+            const dateTotalSeconds = dateEntries.reduce((sum, e) => sum + (e.duration || 0), 0);
+            const dateHours = Math.floor(dateTotalSeconds / 3600);
+            const dateMinutes = Math.floor((dateTotalSeconds % 3600) / 60);
+            const dateSeconds = dateTotalSeconds % 60;
+            const dateTotalStr = `${dateHours}:${String(dateMinutes).padStart(2, '0')}:${String(dateSeconds).padStart(2, '0')}`;
+
+            doc.text(dateTotalStr, startX + columnWidths.user + columnWidths.project, dateY + 5, { width: columnWidths.hours, align: 'right' });
+            doc.moveDown(1.5);
+
+            // Add each entry for this date
+            dateEntries.forEach(entry => {
+                const y = doc.y;
+                doc.fontSize(9).font('Helvetica').fillColor('#000');
+
+                doc.text(entry.user_name || 'N/A', startX, y, { width: columnWidths.user });
+                doc.text(entry.project_name || 'No Project', startX + columnWidths.user, y, { width: columnWidths.project });
+
+                const entryHours = Math.floor((entry.duration || 0) / 3600);
+                const entryMinutes = Math.floor(((entry.duration || 0) % 3600) / 60);
+                const entrySeconds = (entry.duration || 0) % 60;
+                const entryTimeStr = `${entryHours}:${String(entryMinutes).padStart(2, '0')}:${String(entrySeconds).padStart(2, '0')}`;
+
+                doc.text(entryTimeStr, startX + columnWidths.user + columnWidths.project, y, { width: columnWidths.hours, align: 'right' });
+
+                // Status badge
+                const status = entry.approval_status || 'draft';
+                doc.text(status.charAt(0).toUpperCase() + status.slice(1), startX + columnWidths.user + columnWidths.project + columnWidths.hours, y, { width: columnWidths.status, align: 'center' });
+
+                doc.moveDown(0.8);
+
+                // Add new page if needed
+                if (doc.y > 700) {
+                    doc.addPage();
+                }
+            });
+
+            doc.moveDown(0.5);
         });
+
+        // Add footer with total
+        doc.moveDown();
+        doc.moveTo(startX, doc.y).lineTo(550, doc.y).stroke();
+        doc.moveDown();
+        doc.fontSize(12).font('Helvetica-Bold').fillColor('#000');
+        doc.text('TOTAL', startX, doc.y);
+        doc.text(totalHoursStr, startX + columnWidths.user + columnWidths.project, doc.y, { width: columnWidths.hours, align: 'right', continued: false });
 
         doc.end();
     } catch (error) {
@@ -982,7 +1245,7 @@ app.get('/api/reports/export/pdf', getCurrentUser, async (req, res) => {
     }
 });
 
-// 🆕 Reports: Export CSV
+// Reports: Export CSV
 app.get('/api/reports/export/csv', getCurrentUser, async (req, res) => {
     try {
         const { start_date, end_date, user_id } = req.query;
@@ -1000,7 +1263,7 @@ app.get('/api/reports/export/csv', getCurrentUser, async (req, res) => {
             LEFT JOIN projects p ON te.project_id = p.id
             LEFT JOIN tasks t ON te.task_id = t.id
             WHERE te.date >= ? AND te.date <= ?`;
-        
+
         const params = [start_date, end_date];
 
         if (req.user.role === 'employee') {
@@ -1036,7 +1299,7 @@ app.get('/api/reports/export/csv', getCurrentUser, async (req, res) => {
         // Set response headers
         res.setHeader('Content-Type', 'text/csv');
         res.setHeader('Content-Disposition', `attachment; filename=time_report_${start_date}_${end_date}.csv`);
-        
+
         res.send(csv);
     } catch (error) {
         console.error('Export CSV error:', error);
@@ -1046,30 +1309,59 @@ app.get('/api/reports/export/csv', getCurrentUser, async (req, res) => {
 
 // --- Helper Functions ---
 
-// Helper function: Calculate week start (Monday) and week end (Sunday) for a given date
-function getWeekBounds(dateString) {
+// FIXED: Helper function to calculate week start and end based on first_day_of_week setting
+function getWeekBounds(dateString, firstDayOfWeek = 'monday') {
     const date = new Date(dateString);
-    const dayOfWeek = date.getDay(); // 0 = Sunday, 1 = Monday, etc.
+    const currentDay = date.getDay(); // 0 = Sunday, 1 = Monday, ..., 6 = Saturday
 
-    // Calculate Monday of the week (week_start)
-    const monday = new Date(date);
-    const diff = dayOfWeek === 0 ? -6 : 1 - dayOfWeek; // If Sunday, go back 6 days, otherwise go back to Monday
-    monday.setDate(date.getDate() + diff);
+    // Map first_day_of_week string to day number
+    const dayMap = {
+        'sunday': 0,
+        'monday': 1,
+        'tuesday': 2,
+        'wednesday': 3,
+        'thursday': 4,
+        'friday': 5,
+        'saturday': 6
+    };
 
-    // Calculate Sunday of the week (week_end)
-    const sunday = new Date(monday);
-    sunday.setDate(monday.getDate() + 6);
+    const targetDay = dayMap[firstDayOfWeek.toLowerCase()] || 1; // Default to Monday if invalid
+
+    // Calculate how many days to go back to reach the week start
+    let diff = currentDay - targetDay;
+    if (diff < 0) {
+        diff += 7; // If we're before the target day, go back to previous week
+    }
+
+    // Calculate week_start
+    const weekStart = new Date(date);
+    weekStart.setDate(date.getDate() - diff);
+
+    // Calculate week_end (6 days after week_start)
+    const weekEnd = new Date(weekStart);
+    weekEnd.setDate(weekStart.getDate() + 6);
 
     return {
-        week_start: monday.toISOString().split('T')[0],
-        week_end: sunday.toISOString().split('T')[0]
+        week_start: weekStart.toISOString().split('T')[0],
+        week_end: weekEnd.toISOString().split('T')[0]
     };
 }
 
-// Helper function: Update or create draft timesheet for a given user and date
+// UPDATED: Helper function to update or create draft timesheet - updates BOTH duration and total_hours
 async function updateOrCreateDraftTimesheet(userId, entryDate) {
     try {
-        const { week_start, week_end } = getWeekBounds(entryDate);
+        // Fetch user's first_day_of_week setting
+        const [userRows] = await pool.execute(
+            'SELECT first_day_of_week FROM users WHERE id = ?',
+            [userId]
+        );
+
+        const firstDayOfWeek = userRows.length > 0 && userRows[0].first_day_of_week
+            ? userRows[0].first_day_of_week
+            : 'monday';
+
+        // Calculate week bounds using user's setting
+        const { week_start, week_end } = getWeekBounds(entryDate, firstDayOfWeek);
 
         // Check if timesheet exists for this week
         const [existingRows] = await pool.execute(
@@ -1077,51 +1369,52 @@ async function updateOrCreateDraftTimesheet(userId, entryDate) {
             [userId, week_start, week_end]
         );
 
-        // Calculate total hours from all time entries in this week
-        const [[{total_seconds}]] = await pool.execute(
+        // Calculate total duration in seconds from all time entries in this week
+        const [[{ total_seconds }]] = await pool.execute(
             'SELECT COALESCE(SUM(duration), 0) as total_seconds FROM time_entries WHERE user_id = ? AND date >= ? AND date <= ?',
             [userId, week_start, week_end]
         );
-        const total_hours = Math.round((total_seconds || 0) / 3600 * 100) / 100;
+        const duration = total_seconds || 0;
+        const total_hours = duration / 3600; // Convert seconds to hours
 
         if (existingRows.length > 0) {
             const timesheet = existingRows[0];
             // Only update if status is draft
             if (timesheet.status === 'draft') {
                 await pool.execute(
-                    'UPDATE timesheets SET total_hours = ? WHERE id = ?',
-                    [total_hours, timesheet.id]
+                    'UPDATE timesheets SET duration = ?, total_hours = ? WHERE id = ?',
+                    [duration, total_hours, timesheet.id]
                 );
-                console.log(`Updated draft timesheet ${timesheet.id} with ${total_hours} hours`);
+                console.log(`✅ Updated draft timesheet ${timesheet.id} for week ${week_start} to ${week_end} (${firstDayOfWeek} start) with ${Math.round(total_hours * 100) / 100} hours`);
             }
         } else {
             // Create new draft timesheet
             const timesheetId = uuidv4();
             await pool.execute(
-                'INSERT INTO timesheets (id, user_id, week_start, week_end, total_hours, status) VALUES (?, ?, ?, ?, ?, ?)',
-                [timesheetId, userId, week_start, week_end, total_hours, 'draft']
+                'INSERT INTO timesheets (id, user_id, week_start, week_end, duration, total_hours, status) VALUES (?, ?, ?, ?, ?, ?, ?)',
+                [timesheetId, userId, week_start, week_end, duration, total_hours, 'draft']
             );
-            console.log(`Created draft timesheet ${timesheetId} for week ${week_start} with ${total_hours} hours`);
+            console.log(`✅ Created draft timesheet ${timesheetId} for week ${week_start} to ${week_end} (${firstDayOfWeek} start) with ${Math.round(total_hours * 100) / 100} hours`);
         }
     } catch (error) {
-        console.error('Error updating/creating draft timesheet:', error);
+        console.error('❌ Error updating/creating draft timesheet:', error);
         // Don't throw error - this is a background operation
     }
 }
 
-// 🆕 Helper function: Format date range for notifications
+// Helper function: Format date range for notifications
 function formatDateRange(startDate, endDate) {
     const options = { year: 'numeric', month: 'short', day: 'numeric' };
     const start = new Date(startDate);
     const end = new Date(endDate);
-    
+
     const formattedStart = start.toLocaleDateString('en-US', options);
     const formattedEnd = end.toLocaleDateString('en-US', options);
-    
+
     return `${formattedStart} - ${formattedEnd}`;
 }
 
-// 🆕 Helper function: Create notification
+// Helper function: Create notification
 async function createNotification(userId, title, message, type = 'info') {
     try {
         const id = uuidv4();
@@ -1136,7 +1429,7 @@ async function createNotification(userId, title, message, type = 'info') {
     }
 }
 
-// --- Server Init ---
+
 
 const initDefaultUsers = async () => {
     const [rows] = await pool.execute('SELECT id FROM users WHERE role = "admin" LIMIT 1');
@@ -1151,14 +1444,12 @@ const initDefaultUsers = async () => {
     }
 };
 
- 
-
 const PORT = process.env.PORT || 8000;
 app.listen(PORT, async () => {
     try {
-    
         await initDefaultUsers();
-        console.log(`Server running on port ${PORT}`);
+        console.log(`✅ Server running on port ${PORT}`);
+        console.log(`✅ Time entries edit now updates BOTH time_entries and timesheets tables`);
     } catch (err) {
         console.error('Startup error:', err);
     }
